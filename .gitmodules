@@ -1,0 +1,3 @@
+[submodule "opa"]
+	path = opa
+	url = https://github.com/open-policy-agent/opa.git
