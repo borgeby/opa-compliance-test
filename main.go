@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/open-policy-agent/opa/util"
+	"io/ioutil"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -19,167 +22,167 @@ import (
 
 type ResultMap map[string]interface{}
 
+type ExtendedTestCase struct {
+	cases.TestCase
+	EntryPoints    []string    `json:"entrypoints"`
+	Plan           interface{} `json:"plan"`
+	WantPlanResult interface{} `json:"want_plan_result"`
+}
+
+type Test struct {
+	filename string
+	Cases    []*ExtendedTestCase `json:"cases"`
+}
+
 func main() {
+	args := os.Args
+	var srcPath, dstPath string
+
+	switch len(args) {
+	case 2:
+		srcPath = "opa/test/cases/testdata"
+		dstPath = args[1]
+	case 3:
+		srcPath = args[1]
+		dstPath = args[2]
+	default:
+		panic(fmt.Sprintf("Usage: %s [SRC] DST", args[0]))
+	}
+
+	generate(srcPath, dstPath)
+}
+
+func generate(srcPath string, dstPath string) {
 	fmt.Println("Generating compliance tests")
 
 	successCount, failureCount := 0, 0
 
-	for _, tc := range cases.MustLoad("opa/test/cases/testdata").Sorted().Cases {
-		//fmt.Printf("%s - %s\n", tc.Filename, tc.Note)
+	for _, t := range loadTests(srcPath) {
+		for _, tc := range t.Cases {
+			modules := map[string]string{}
+			for i, mod := range tc.Modules {
+				modules[fmt.Sprintf("mod_%d", i)] = mod
+			}
+			modFiles := getModuleFiles(modules, false)
 
-		folderPath, err := createFolder(tc)
-		if err != nil {
-			panic(err)
-		}
+			var entryPoints []string
+			for _, modFile := range modFiles {
+				entryPoints = append(entryPoints, strings.TrimPrefix(strings.ReplaceAll(modFile.Parsed.Package.Path.String(), ".", "/"), "data/"))
+			}
+			tc.EntryPoints = entryPoints
 
-		modules := map[string]string{}
-		for i, mod := range tc.Modules {
-			modules[fmt.Sprintf("mod_%d", i)] = mod
-		}
-		//fmt.Printf("modules: %v\n", modules)
-		modFiles := getModuleFiles(modules, false)
+			b := bundle.Bundle{Modules: modFiles}
 
-		var entryPoints []string
-		for _, modFile := range modFiles {
-			entryPoints = append(entryPoints, strings.TrimPrefix(strings.ReplaceAll(modFile.Parsed.Package.Path.String(), ".", "/"), "data/"))
-		}
-
-		//fmt.Printf("entrypoints: %v\n", entryPoints)
-
-		b := bundle.Bundle{Modules: modFiles}
-
-		compiler := compile.New().
-			WithTarget("plan").
-			WithEntrypoints(entryPoints...).
-			WithBundle(&b)
-		if err := compiler.Build(context.Background()); err != nil {
-			fmt.Printf("Skipping %s: %v\n", tc.Note, err)
-			//log.Fatal(err)
-			failureCount++
-			continue
-		}
-
-		if len(b.PlanModules) != 1 {
-			fmt.Printf("Unexpected plan count: %d\n", len(b.PlanModules))
-			failureCount++
-			continue
-		}
-
-		expectedResultSet, err := eval(entryPoints, tc)
-		if err != nil {
-			fmt.Printf("Skipping %s: %v\n", tc.Note, err)
-			failureCount++
-			continue
-		}
-
-		if len(expectedResultSet) != 1 {
-			fmt.Printf("Unexpected result count: %d\n", len(expectedResultSet))
-			failureCount++
-			continue
-		}
-
-		planData, err := indent(b.PlanModules[0].Raw)
-		if err != nil {
-			fmt.Printf("Failed to marshal plan: %s\n", err.Error())
-			failureCount++
-			continue
-		}
-		if err := writeWile(folderPath, "plan.json", planData); err != nil { // We know there is only one plan
-			fmt.Printf("Failed to write plan: %s\n", err.Error())
-			failureCount++
-			continue
-		}
-
-		if tc.Input != nil {
-			input, err := json.MarshalIndent(tc.Input, "", "\t")
-			if err != nil {
-				fmt.Printf("Failed to marshal input: %s\n", err.Error())
+			compiler := compile.New().
+				WithTarget("plan").
+				WithEntrypoints(entryPoints...).
+				WithBundle(&b)
+			if err := compiler.Build(context.Background()); err != nil {
+				fmt.Printf("Skipping %s: %v\n", tc.Note, err)
 				failureCount++
 				continue
 			}
-			if err := writeWile(folderPath, "input.json", input); err != nil { // We know there is only one plan
-				fmt.Printf("Failed to write input: %s\n", err.Error())
+
+			if len(b.PlanModules) != 1 {
+				fmt.Printf("Unexpected plan count: %d\n", len(b.PlanModules))
 				failureCount++
 				continue
 			}
+
+			if tc.WantError == nil {
+				expectedResultSet, err := eval(entryPoints, tc)
+				if err != nil {
+					fmt.Printf("Skipping %s: %v\n", tc.Note, err)
+					failureCount++
+					continue
+				}
+
+				if len(expectedResultSet) != 1 {
+					fmt.Printf("Unexpected result count: %d\n", len(expectedResultSet))
+					failureCount++
+					continue
+				}
+
+				tc.WantPlanResult = expectedResultSet[0]
+			}
+
+			var plan interface{}
+			if err := json.Unmarshal(b.PlanModules[0].Raw, &plan); err != nil {
+				fmt.Printf("Failed to unmarshal plan: %s\n", err.Error())
+				failureCount++
+				continue
+			}
+			tc.Plan = plan
+
+			successCount++
 		}
 
-		if tc.Data != nil {
-			data, err := json.MarshalIndent(tc.Data, "", "\t")
-			if err != nil {
-				fmt.Printf("Failed to marshal data: %s\n", err.Error())
-				failureCount++
-				continue
+		if tcJson, err := json.MarshalIndent(t, "", "\t"); err != nil {
+			fmt.Printf("Failed to marchal tc to json: %s\n", err.Error())
+			failureCount++
+			continue
+		} else {
+			tPath := strings.Split(t.filename, "/")
+			folderPath := fmt.Sprintf("%s/%s", dstPath, tPath[len(tPath)-2])
+			tcFileName := strings.ReplaceAll(tPath[len(tPath)-1], ".yaml", ".json")
+
+			if err := os.MkdirAll(folderPath, 0755); err != nil {
+				panic(err)
 			}
-			if err := writeWile(folderPath, "data.json", data); err != nil { // We know there is only one plan
-				fmt.Printf("Failed to write data: %s\n", err.Error())
+
+			if err := writeWile(folderPath, tcFileName, tcJson); err != nil {
+				fmt.Printf("Failed to write tc: %s\n", err.Error())
 				failureCount++
 				continue
 			}
 		}
-
-		for entryPoint, expectedResult := range expectedResultSet[0] { // We know there is only one result
-			fileName := fmt.Sprintf("expected_%s.json", entryPoint)
-			data, err := json.MarshalIndent(expectedResult, "", "\t")
-			if err != nil {
-				fmt.Printf("Failed to marshal expected result: %s\n", err.Error())
-				failureCount++
-				continue
-			}
-			if err := writeWile(folderPath, fileName, data); err != nil { // We know there is only one plan
-				fmt.Printf("Failed to write expected result: %s\n", err.Error())
-				failureCount++
-				continue
-			}
-		}
-
-		successCount++
 	}
 
 	fmt.Printf("Tests generated: %d; successes: %d; failures: %d\n", successCount+failureCount, successCount, failureCount)
 }
 
-func indent(raw []byte) ([]byte, error) {
-	var d interface{}
-	if err := json.Unmarshal(raw, &d); err != nil {
-		return nil, err
+func loadTests(dirpath string) []Test {
+
+	var result []Test
+
+	err := filepath.Walk(dirpath, func(path string, info os.FileInfo, err error) error {
+
+		if err != nil {
+			return err
+		}
+
+		if info.IsDir() {
+			return nil
+		}
+
+		bs, err := ioutil.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("%s: %w", path, err)
+		}
+
+		var x Test
+		if err := util.Unmarshal(bs, &x); err != nil {
+			return fmt.Errorf("%s: %w", path, err)
+		}
+
+		for i := range x.Cases {
+			x.Cases[i].Filename = path
+			x.filename = path
+		}
+
+		result = append(result, x)
+		return nil
+	})
+
+	if err != nil {
+		panic(err)
 	}
-	return json.MarshalIndent(d, "", "\t")
+
+	return result
 }
 
 func writeWile(folderPath string, name string, data []byte) error {
 	return os.WriteFile(fmt.Sprintf("%s/%s", folderPath, name), data, 0644)
-}
-
-func createFolder(tc cases.TestCase) (string, error) {
-	parts := strings.SplitN(tc.Note, "/", 2)
-
-	var group, name string
-
-	switch len(parts) {
-	case 1:
-		fileParts := strings.Split(tc.Filename, "/")
-		l := len(fileParts)
-		if l < 2 {
-			return "", fmt.Errorf("test case file path could not be split into group: %s", tc.Filename)
-		}
-		group = fileParts[l-2 : l-1][0]
-		name = parts[0]
-	case 2:
-		group = parts[0]
-		name = parts[1]
-	default:
-		return "", fmt.Errorf("test case note could not be split into group and name: %s", tc.Note)
-	}
-
-	name = strings.ReplaceAll(name, " ", "_")
-
-	path := fmt.Sprintf("tmp/%s/%s", group, name)
-	if err := os.MkdirAll(path, 0755); err != nil {
-		return "", err
-	}
-
-	return path, nil
 }
 
 func getModuleFiles(src map[string]string, includeRaw bool) []bundle.ModuleFile {
@@ -221,7 +224,7 @@ func createQuery(entryPoints []string) ast.Body {
 	return q
 }
 
-func eval(entryPoints []string, tc cases.TestCase) ([]ResultMap, error) {
+func eval(entryPoints []string, tc *ExtendedTestCase) ([]ResultMap, error) {
 	ctx := context.Background()
 
 	q := createQuery(entryPoints)
@@ -264,33 +267,9 @@ func eval(entryPoints []string, tc cases.TestCase) ([]ResultMap, error) {
 		WithStrictBuiltinErrors(tc.StrictError).
 		Run(ctx)
 
-	if err != nil {
+	if err != nil && tc.WantErrorCode == nil && tc.WantError == nil {
 		return nil, err
 	}
-
-	//if tc.WantError != nil {
-	//	testAssertErrorText(t, *tc.WantError, err)
-	//}
-
-	//if tc.WantErrorCode != nil {
-	//	testAssertErrorCode(t, *tc.WantErrorCode, err)
-	//}
-
-	//if err != nil && tc.WantErrorCode == nil && tc.WantError == nil {
-	//	t.Fatalf("unexpected error: %v", err)
-	//}
-
-	//if tc.WantResult != nil {
-	//	testAssertResultSet(t, *tc.WantResult, rs, tc.SortBindings)
-	//}
-
-	//if tc.WantResult == nil && tc.WantErrorCode == nil && tc.WantError == nil {
-	//	t.Fatal("expected one of: 'want_result', 'want_error_code', or 'want_error'")
-	//}
-
-	//if testing.Verbose() {
-	//	PrettyTrace(os.Stderr, *buf)
-	//}
 
 	if len(qrs) > 1 {
 		return nil, fmt.Errorf("ResultSet contains more than one entry")
