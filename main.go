@@ -4,12 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/open-policy-agent/opa/util"
 	"io/ioutil"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
+
+	"github.com/open-policy-agent/opa/types"
+	"github.com/open-policy-agent/opa/util"
 
 	"github.com/open-policy-agent/opa/ast"
 	"github.com/open-policy-agent/opa/bundle"
@@ -59,15 +62,31 @@ func generate(srcPath string, dstPath string) {
 
 	for _, t := range loadTests(srcPath) {
 		for _, tc := range t.Cases {
+			// if tc.Note != "withkeyword/with not stack (data)" {
+			// 	continue
+			// }
+
 			modules := map[string]string{}
 			for i, mod := range tc.Modules {
 				modules[fmt.Sprintf("mod_%d", i)] = mod
 			}
 			modFiles := getModuleFiles(modules, false)
 
+			if len(modFiles) == 0 {
+				fmt.Printf("Skipping %s: No modules\n", tc.Note)
+				continue
+			}
+
+			var packageNames []string
 			var entryPoints []string
 			for _, modFile := range modFiles {
-				entryPoints = append(entryPoints, strings.TrimPrefix(strings.ReplaceAll(modFile.Parsed.Package.Path.String(), ".", "/"), "data/"))
+				var pkg = modFile.Parsed.Package.Path.String()
+				if len(modFile.Parsed.Rules) == 0 {
+					fmt.Printf("Skipping %s in %s: No rules\n", pkg, tc.Note)
+					continue
+				}
+				packageNames = append(packageNames, pkg)
+				entryPoints = append(entryPoints, strings.ReplaceAll(strings.TrimPrefix(pkg, "data."), ".", "/"))
 			}
 			tc.EntryPoints = entryPoints
 
@@ -75,30 +94,31 @@ func generate(srcPath string, dstPath string) {
 
 			compiler := compile.New().
 				WithTarget("plan").
+				WithPruneUnused(true).
 				WithEntrypoints(entryPoints...).
 				WithBundle(&b)
 			if err := compiler.Build(context.Background()); err != nil {
-				fmt.Printf("Skipping %s: %v\n", tc.Note, err)
+				fmt.Printf("compile/Skipping %s: %v\n", tc.Note, err)
 				failureCount++
 				continue
 			}
 
 			if len(b.PlanModules) != 1 {
-				fmt.Printf("Unexpected plan count: %d\n", len(b.PlanModules))
+				fmt.Printf("Unexpected plan count %d for %s\n", len(b.PlanModules), tc.Note)
 				failureCount++
 				continue
 			}
 
-			if tc.WantError == nil {
-				expectedResultSet, err := eval(entryPoints, tc)
+			if tc.WantError == nil && tc.WantErrorCode == nil {
+				expectedResultSet, err := eval(packageNames, tc)
 				if err != nil {
-					fmt.Printf("Skipping %s: %v\n", tc.Note, err)
+					fmt.Printf("eval/Skipping %s: %v\n", tc.Note, err)
 					failureCount++
 					continue
 				}
 
 				if len(expectedResultSet) != 1 {
-					fmt.Printf("Unexpected result count: %d\n", len(expectedResultSet))
+					fmt.Printf("Unexpected result count %d for %s\n", len(expectedResultSet), tc.Note)
 					failureCount++
 					continue
 				}
@@ -109,6 +129,10 @@ func generate(srcPath string, dstPath string) {
 			var plan interface{}
 			if err := json.Unmarshal(b.PlanModules[0].Raw, &plan); err != nil {
 				fmt.Printf("Failed to unmarshal plan: %s\n", err.Error())
+				failureCount++
+				continue
+			} else if plan == nil {
+				fmt.Printf("Failed to unmarshal plan: nil\n")
 				failureCount++
 				continue
 			}
@@ -153,6 +177,10 @@ func loadTests(dirpath string) []Test {
 
 		if info.IsDir() {
 			return nil
+		}
+
+		if strings.HasSuffix(path, "test-functions-1006.yaml") {
+			fmt.Printf("break\n")
 		}
 
 		bs, err := ioutil.ReadFile(path)
@@ -214,20 +242,21 @@ func getModuleFiles(src map[string]string, includeRaw bool) []bundle.ModuleFile 
 	return modules
 }
 
-func createQuery(entryPoints []string) ast.Body {
+func createQuery(packageNames []string) ast.Body {
 	q := ast.Body{}
-	for _, entryPoint := range entryPoints {
-		expr := ast.MustParseExpr(fmt.Sprintf("%s = data.%s", entryPoint, entryPoint))
+	for _, pkg := range packageNames {
+		expr := ast.MustParseExpr(fmt.Sprintf("%s = %s", strings.ReplaceAll(pkg, ".", "_"), pkg))
 		q = append(q, expr)
 	}
 
 	return q
 }
 
-func eval(entryPoints []string, tc *ExtendedTestCase) ([]ResultMap, error) {
+func eval(packageNames []string, tc *ExtendedTestCase) ([]ResultMap, error) {
+	// log.Printf("\nE: %v", packageNames)
 	ctx := context.Background()
 
-	q := createQuery(entryPoints)
+	q := createQuery(packageNames)
 
 	modules := map[string]string{}
 	for i, module := range tc.Modules {
@@ -235,6 +264,7 @@ func eval(entryPoints []string, tc *ExtendedTestCase) ([]ResultMap, error) {
 	}
 
 	compiler := ast.MustCompileModules(modules)
+	// log.Printf("\nQ: %v", q)
 	query, err := compiler.QueryCompiler().Compile(q)
 
 	if err != nil {
@@ -289,4 +319,21 @@ func eval(entryPoints []string, tc *ExtendedTestCase) ([]ResultMap, error) {
 	}
 
 	return resultSet, nil
+}
+
+func init() {
+	// Used by the 'time/time caching' test
+	ast.RegisterBuiltin(&ast.Builtin{
+		Name: "test.sleep",
+		Decl: types.NewFunction(
+			types.Args(types.S),
+			types.NewNull(),
+		),
+	})
+
+	topdown.RegisterBuiltinFunc("test.sleep", func(_ topdown.BuiltinContext, operands []*ast.Term, iter func(*ast.Term) error) error {
+		d, _ := time.ParseDuration(string(operands[0].Value.(ast.String)))
+		time.Sleep(d)
+		return iter(ast.NullTerm())
+	})
 }
